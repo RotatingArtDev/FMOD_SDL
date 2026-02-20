@@ -55,9 +55,15 @@ typedef struct FMOD_SDL_Device
 
 static void FMOD_SDL_MixCallback(void* userdata, Uint8 *stream,	int len)
 {
+	static int logged = 0;
 	FMOD_OUTPUT_STATE *output_state = (FMOD_OUTPUT_STATE*) userdata;
 	FMOD_SDL_Device *dev = (FMOD_SDL_Device*)
 		output_state->plugindata;
+	if (!logged)
+	{
+		SDL_Log("FMOD_SDL_MixCallback entered (first call), len=%d", len);
+		logged = 1;
+	}
 	if (output_state->readfrommixer(
 		output_state,
 		stream,
@@ -71,6 +77,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_GetNumDrivers(
 	FMOD_OUTPUT_STATE *output_state,
 	int *numdrivers
 ) {
+	SDL_Log("FMOD_SDL_GetNumDrivers entered");
 	*numdrivers = SDL_GetNumAudioDevices(0);
 	if (*numdrivers > 0)
 	{
@@ -89,6 +96,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_GetDriverInfo(
 	FMOD_SPEAKERMODE *speakermode,
 	int *speakermodechannels
 ) {
+	SDL_Log("FMOD_SDL_GetDriverInfo entered, id=%d", id);
 	const char *envvar;
 	SDL_AudioSpec spec;
 	int devcount, i;
@@ -248,6 +256,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_Init(
 #endif
 	void *extradriverdata
 ) {
+	SDL_Log("FMOD_SDL_Init entered, selecteddriver=%d", selecteddriver);
 	FMOD_SDL_Device *device;
 	SDL_AudioSpec want, have;
 
@@ -353,6 +362,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_Init(
 
 static FMOD_RESULT F_CALLBACK FMOD_SDL_Start(FMOD_OUTPUT_STATE *output_state)
 {
+	SDL_Log("FMOD_SDL_Start entered");
 	FMOD_SDL_Device *dev = (FMOD_SDL_Device*)
 		output_state->plugindata;
 	SDL_PauseAudioDevice(dev->device, 0);
@@ -361,6 +371,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_Start(FMOD_OUTPUT_STATE *output_state)
 
 static FMOD_RESULT F_CALLBACK FMOD_SDL_Stop(FMOD_OUTPUT_STATE *output_state)
 {
+	SDL_Log("FMOD_SDL_Stop entered");
 	FMOD_SDL_Device *dev = (FMOD_SDL_Device*)
 		output_state->plugindata;
 	SDL_PauseAudioDevice(dev->device, 1);
@@ -369,6 +380,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_Stop(FMOD_OUTPUT_STATE *output_state)
 
 static FMOD_RESULT F_CALLBACK FMOD_SDL_Close(FMOD_OUTPUT_STATE *output_state)
 {
+	SDL_Log("FMOD_SDL_Close entered");
 	FMOD_SDL_Device *dev = (FMOD_SDL_Device*)
 		output_state->plugindata;
 	SDL_CloseAudioDevice(dev->device);
@@ -408,17 +420,59 @@ static FMOD_OUTPUT_DESCRIPTION FMOD_SDL_Driver =
 
 /* Public API Implementation */
 
+typedef FMOD_RESULT (*systemRegisterOutputFunc)(
+	FMOD_SYSTEM *system,
+	const FMOD_OUTPUT_DESCRIPTION *description,
+	unsigned int *handle
+);
+typedef FMOD_RESULT (*systemSetOutputByPluginFunc)(
+	FMOD_SYSTEM *system,
+	unsigned int handle
+);
+
 #ifndef PRELOAD_MODE
 F_EXPORT void FMOD_SDL_Register(FMOD_SYSTEM *system)
 {
+	void *fmodlib;
+	systemRegisterOutputFunc systemRegisterOutput;
+	systemSetOutputByPluginFunc systemSetOutputByPlugin;
+	FMOD_RESULT registerResult;
+	FMOD_RESULT setOutputResult;
 	unsigned int handle;
+	SDL_Log("FMOD_SDL_Register entered");
+
+	fmodlib = SDL_LoadObject("libfmod.so");
+	if (fmodlib == NULL)
+	{
+		SDL_Log("Failed to load libfmod.so: %s", SDL_GetError());
+		return;
+	}
+	systemRegisterOutput = (systemRegisterOutputFunc)
+		SDL_LoadFunction(fmodlib, "FMOD_System_RegisterOutput");
+	systemSetOutputByPlugin = (systemSetOutputByPluginFunc)
+		SDL_LoadFunction(fmodlib, "FMOD_System_SetOutputByPlugin");
+	if ((systemRegisterOutput == NULL) || (systemSetOutputByPlugin == NULL))
+	{
+		SDL_Log("Failed to load FMOD output symbols: %s", SDL_GetError());
+		return;
+	}
+
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
 	{
 		SDL_Log("SDL_INIT_AUDIO failed: %s", SDL_GetError());
 		return;
 	}
-	FMOD_System_RegisterOutput(system, &FMOD_SDL_Driver, &handle);
-	FMOD_System_SetOutputByPlugin(system, handle);
+	registerResult = systemRegisterOutput(system, &FMOD_SDL_Driver, &handle);
+	SDL_Log(
+		"FMOD_System_RegisterOutput returned: %d, handle: %u",
+		registerResult,
+		handle
+	);
+	setOutputResult = systemSetOutputByPlugin(system, handle);
+	SDL_Log(
+		"FMOD_System_SetOutputByPlugin returned: %d",
+		setOutputResult
+	);
 }
 #else
 typedef FMOD_RESULT (*studioSystemCreateFunc)(
@@ -429,15 +483,6 @@ typedef FMOD_RESULT (*studioSystemGetCoreFunc)(
 	FMOD_STUDIO_SYSTEM *system,
 	FMOD_SYSTEM **coreSystem
 );
-typedef FMOD_RESULT (*systemRegisterOutputFunc)(
-	FMOD_SYSTEM *system,
-	FMOD_OUTPUT_DESCRIPTION *description,
-	unsigned int *handle
-);
-typedef FMOD_RESULT (*systemSetOutputByPluginFunc)(
-	FMOD_SYSTEM *system,
-	unsigned int handle
-);
 FMOD_RESULT F_API FMOD_Studio_System_Create(
 	FMOD_STUDIO_SYSTEM **system,
 	unsigned int headerVersion
@@ -445,12 +490,15 @@ FMOD_RESULT F_API FMOD_Studio_System_Create(
 	void* fmodlib;
 	char fmodname[32];
 	FMOD_RESULT result;
+	FMOD_RESULT registerResult;
+	FMOD_RESULT setOutputResult;
 	unsigned int handle;
 	FMOD_SYSTEM *core = NULL;
 	studioSystemCreateFunc studioSystemCreate;
 	studioSystemGetCoreFunc studioSystemGetCore;
 	systemRegisterOutputFunc systemRegisterOutput;
 	systemSetOutputByPluginFunc systemSetOutputByPlugin;
+	SDL_Log("FMOD_Studio_System_Create entered");
 
 	/* Can't mix up versions, ABI breakages urrywhur */
 	SDL_Log(
@@ -512,8 +560,17 @@ FMOD_RESULT F_API FMOD_Studio_System_Create(
 		SDL_Log("SDL_INIT_AUDIO failed: %s", SDL_GetError());
 		return FMOD_OK;
 	}
-	systemRegisterOutput(core, &FMOD_SDL_Driver, &handle);
-	systemSetOutputByPlugin(core, handle);
+	registerResult = systemRegisterOutput(core, &FMOD_SDL_Driver, &handle);
+	SDL_Log(
+		"FMOD_System_RegisterOutput returned: %d, handle: %u",
+		registerResult,
+		handle
+	);
+	setOutputResult = systemSetOutputByPlugin(core, handle);
+	SDL_Log(
+		"FMOD_System_SetOutputByPlugin returned: %d",
+		setOutputResult
+	);
 	/* mono needs this to leak :| SDL_UnloadObject(fmodlib); */
 
 	#undef LOAD_FUNC
