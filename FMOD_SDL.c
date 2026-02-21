@@ -83,6 +83,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_GetNumDrivers(
 	{
 		*numdrivers += 1;
 	}
+    SDL_Log("FMOD_SDL_GetNumDrivers: numdrivers=%d", *numdrivers);
 	return FMOD_OK;
 }
 
@@ -287,6 +288,7 @@ static FMOD_RESULT F_CALLBACK FMOD_SDL_Init(
 	}
 	want.silence = 0;
 	want.callback = FMOD_SDL_MixCallback;
+    SDL_Log("FMOD_SDL_Init: dspbufferlength=%d", dspbufferlength);
 	want.samples = dspbufferlength;
 	want.userdata = output_state;
 
@@ -429,6 +431,42 @@ typedef FMOD_RESULT (*systemSetOutputByPluginFunc)(
 	FMOD_SYSTEM *system,
 	unsigned int handle
 );
+typedef FMOD_RESULT (*systemGetDSPBufferSizeFunc)(
+	FMOD_SYSTEM *system,
+	unsigned int *bufferlength,
+	int *numbuffers
+);
+typedef FMOD_RESULT (*systemSetDSPBufferSizeFunc)(
+	FMOD_SYSTEM *system,
+	unsigned int bufferlength,
+	int numbuffers
+);
+
+static unsigned int FMOD_SDL_GetDSPBufferSizeOverride(unsigned int fallbackLength)
+{
+	const char *envvar = SDL_getenv("RAL_AUDIO_BUFFERSIZE");
+	int forcedLength;
+
+	if (envvar == NULL)
+	{
+		return fallbackLength;
+	}
+
+	forcedLength = SDL_atoi(envvar);
+	if (forcedLength <= 0)
+	{
+		SDL_Log("Ignoring invalid RAL_AUDIO_BUFFERSIZE: %s", envvar);
+		return fallbackLength;
+	}
+
+	if (forcedLength > SDL_MAX_UINT16)
+	{
+		SDL_Log("RAL_AUDIO_BUFFERSIZE is too large (%d), clamping to %d", forcedLength, SDL_MAX_UINT16);
+		forcedLength = SDL_MAX_UINT16;
+	}
+
+	return (unsigned int) forcedLength;
+}
 
 #ifndef PRELOAD_MODE
 F_EXPORT void FMOD_SDL_Register(FMOD_SYSTEM *system)
@@ -436,8 +474,15 @@ F_EXPORT void FMOD_SDL_Register(FMOD_SYSTEM *system)
 	void *fmodlib;
 	systemRegisterOutputFunc systemRegisterOutput;
 	systemSetOutputByPluginFunc systemSetOutputByPlugin;
+	systemGetDSPBufferSizeFunc systemGetDSPBufferSize;
+	systemSetDSPBufferSizeFunc systemSetDSPBufferSize;
+	FMOD_RESULT getBufferSizeResult;
+	FMOD_RESULT setBufferSizeResult;
 	FMOD_RESULT registerResult;
 	FMOD_RESULT setOutputResult;
+	unsigned int bufferLength = 0;
+	unsigned int targetBufferLength;
+	int numBuffers = 4;
 	unsigned int handle;
 	SDL_Log("FMOD_SDL_Register entered");
 
@@ -451,16 +496,42 @@ F_EXPORT void FMOD_SDL_Register(FMOD_SYSTEM *system)
 		SDL_LoadFunction(fmodlib, "FMOD_System_RegisterOutput");
 	systemSetOutputByPlugin = (systemSetOutputByPluginFunc)
 		SDL_LoadFunction(fmodlib, "FMOD_System_SetOutputByPlugin");
+	systemGetDSPBufferSize = (systemGetDSPBufferSizeFunc)
+		SDL_LoadFunction(fmodlib, "FMOD_System_GetDSPBufferSize");
+	systemSetDSPBufferSize = (systemSetDSPBufferSizeFunc)
+		SDL_LoadFunction(fmodlib, "FMOD_System_SetDSPBufferSize");
 	if ((systemRegisterOutput == NULL) || (systemSetOutputByPlugin == NULL))
 	{
 		SDL_Log("Failed to load FMOD output symbols: %s", SDL_GetError());
 		return;
+	}
+	if ((systemGetDSPBufferSize == NULL) || (systemSetDSPBufferSize == NULL))
+	{
+		SDL_Log("Failed to load FMOD DSP buffer symbols: %s", SDL_GetError());
 	}
 
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
 	{
 		SDL_Log("SDL_INIT_AUDIO failed: %s", SDL_GetError());
 		return;
+	}
+	if ((systemGetDSPBufferSize != NULL) && (systemSetDSPBufferSize != NULL))
+	{
+		getBufferSizeResult = systemGetDSPBufferSize(system, &bufferLength, &numBuffers);
+		SDL_Log(
+			"FMOD_System_GetDSPBufferSize returned: %d, length: %u, numBuffers: %d",
+			getBufferSizeResult,
+			bufferLength,
+			numBuffers
+		);
+		targetBufferLength = FMOD_SDL_GetDSPBufferSizeOverride(bufferLength);
+		setBufferSizeResult = systemSetDSPBufferSize(system, targetBufferLength, numBuffers);
+		SDL_Log(
+			"FMOD_System_SetDSPBufferSize returned: %d, length: %u, numBuffers: %d",
+			setBufferSizeResult,
+			targetBufferLength,
+			numBuffers
+		);
 	}
 	registerResult = systemRegisterOutput(system, &FMOD_SDL_Driver, &handle);
 	SDL_Log(
@@ -490,14 +561,21 @@ FMOD_RESULT F_API FMOD_Studio_System_Create(
 	void* fmodlib;
 	char fmodname[32];
 	FMOD_RESULT result;
+	FMOD_RESULT getBufferSizeResult;
+	FMOD_RESULT setBufferSizeResult;
 	FMOD_RESULT registerResult;
 	FMOD_RESULT setOutputResult;
 	unsigned int handle;
+	unsigned int bufferLength = 0;
+	unsigned int targetBufferLength;
+	int numBuffers = 4;
 	FMOD_SYSTEM *core = NULL;
 	studioSystemCreateFunc studioSystemCreate;
 	studioSystemGetCoreFunc studioSystemGetCore;
 	systemRegisterOutputFunc systemRegisterOutput;
 	systemSetOutputByPluginFunc systemSetOutputByPlugin;
+	systemGetDSPBufferSizeFunc systemGetDSPBufferSize;
+	systemSetDSPBufferSizeFunc systemSetDSPBufferSize;
 	SDL_Log("FMOD_Studio_System_Create entered");
 
 	/* Can't mix up versions, ABI breakages urrywhur */
@@ -553,12 +631,36 @@ FMOD_RESULT F_API FMOD_Studio_System_Create(
 	fmodlib = SDL_LoadObject(fmodname);
 	LOAD_FUNC(systemRegisterOutput, "FMOD_System_RegisterOutput")
 	LOAD_FUNC(systemSetOutputByPlugin, "FMOD_System_SetOutputByPlugin")
+	LOAD_FUNC(systemGetDSPBufferSize, "FMOD_System_GetDSPBufferSize")
+	LOAD_FUNC(systemSetDSPBufferSize, "FMOD_System_SetDSPBufferSize")
+	if ((systemGetDSPBufferSize == NULL) || (systemSetDSPBufferSize == NULL))
+	{
+		SDL_Log("Failed to load FMOD DSP buffer symbols: %s", SDL_GetError());
+	}
 
 	/* FMOD_SDL_Register */
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
 	{
 		SDL_Log("SDL_INIT_AUDIO failed: %s", SDL_GetError());
 		return FMOD_OK;
+	}
+	if ((systemGetDSPBufferSize != NULL) && (systemSetDSPBufferSize != NULL))
+	{
+		getBufferSizeResult = systemGetDSPBufferSize(core, &bufferLength, &numBuffers);
+		SDL_Log(
+			"FMOD_System_GetDSPBufferSize returned: %d, length: %u, numBuffers: %d",
+			getBufferSizeResult,
+			bufferLength,
+			numBuffers
+		);
+		targetBufferLength = FMOD_SDL_GetDSPBufferSizeOverride(256);
+		setBufferSizeResult = systemSetDSPBufferSize(core, targetBufferLength, numBuffers);
+		SDL_Log(
+			"FMOD_System_SetDSPBufferSize returned: %d, length: %u, numBuffers: %d",
+			setBufferSizeResult,
+			targetBufferLength,
+			numBuffers
+		);
 	}
 	registerResult = systemRegisterOutput(core, &FMOD_SDL_Driver, &handle);
 	SDL_Log(
